@@ -4,10 +4,10 @@ import { SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-
 import { CSS } from '@dnd-kit/utilities';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useQuery } from '@tanstack/react-query';
-import { formatDistanceToNow } from 'date-fns';
+import { formatDistanceToNow, format } from 'date-fns';
 import { zhCN } from 'date-fns/locale';
-import { Eye, Radio, ShieldAlert, UserCheck, Users } from 'lucide-react';
-import { useEffect } from 'react';
+import { Eye, Radio, ShieldAlert, UserCheck, Users, UserX } from 'lucide-react';
+import { useEffect, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { useTranslations } from 'next-intl';
 import { z } from 'zod';
@@ -15,7 +15,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
-import { useIncidentStore, type ResponseAction } from '@/lib/store';
+import { activeDelegationFor, useIncidentStore, type ResponseAction } from '@/lib/store';
 
 const formSchema = z.object({ title: z.string().min(4, '请填写至少4个字的子事件'), owner: z.string().min(2, '请填写负责组') });
 const roleNames = { analyst: '分析员', responder: '响应负责人', legal: '法务/公关', viewer: '访客' };
@@ -23,15 +23,30 @@ const roleNames = { analyst: '分析员', responder: '响应负责人', legal: '
 function SortableAction({ action }: { action: ResponseAction }) {
   const store = useIncidentStore();
   const sortable = useSortable({ id: action.id });
+  const [expiry, setExpiry] = useState('');
   const canSee = !action.sensitive || ['responder', 'legal'].includes(store.role);
+  const delegation = activeDelegationFor(store.delegations, action.id);
+  const inactiveDelegation = !delegation ? [...store.delegations].reverse().find((item) => item.actionId === action.id) : undefined;
+  const alreadyApproved = action.approvals.includes(store.role);
+  const analystNeedsDelegation = store.role === 'analyst' && !delegation;
+  const approveDisabled = store.demoMode || store.role === 'viewer' || alreadyApproved || analystNeedsDelegation;
+  const approveTitle = store.role === 'analyst' && !delegation ? '无有效审批委托，不能审批' : alreadyApproved ? '已审批' : '审批';
   return (
     <div ref={sortable.setNodeRef} style={{ transform: CSS.Transform.toString(sortable.transform), transition: sortable.transition }} className="action-row">
-      <div><strong>{canSee ? action.title : '敏感处置动作（当前角色不可见）'}</strong><div className="muted">{action.kind} · 审批人 {action.approvals.join('、') || '无'} · {action.status}</div></div>
+      <div><strong>{canSee ? action.title : '敏感处置动作（当前角色不可见）'}</strong><div className="muted">{action.kind} · 审批人 {action.approvals.join('、') || '无'} · {action.status}</div>
+        {delegation && <Badge className="delegate-badge">已委托分析员 · 到期 {format(new Date(delegation.expiresAt), 'MM-dd HH:mm')}</Badge>}
+        {!delegation && inactiveDelegation && <Badge className="delegate-badge stale">{inactiveDelegation.revoked ? '委托已撤销' : '委托已过期'}</Badge>}
+      </div>
       <div className="row-actions">
-        <Button size="sm" variant="outline" disabled={store.demoMode || store.role === 'viewer' || action.approvals.includes(store.role)} onClick={() => store.approveAction(action.id)}><UserCheck size={14} />审批</Button>
+        <Button size="sm" variant="outline" disabled={approveDisabled} title={approveTitle} onClick={() => store.approveAction(action.id)}><UserCheck size={14} />审批</Button>
         <Button size="sm" disabled={store.demoMode || store.role === 'viewer'} onClick={() => store.executeAction(action.id)}>执行</Button>
         <Button size="sm" variant="ghost" {...sortable.attributes} {...sortable.listeners}>排序</Button>
       </div>
+      {store.role === 'responder' && <div className="delegate-row">
+        {delegation
+          ? <><span className="muted">分析员可凭委托审批本动作，到期自动失效。</span><Button size="sm" variant="outline" disabled={store.demoMode} onClick={() => store.revokeDelegation(delegation.id)}><UserX size={14} />撤销委托</Button></>
+          : <><Input type="datetime-local" value={expiry} onChange={(event) => setExpiry(event.target.value)} /><Button size="sm" variant="outline" disabled={store.demoMode || !expiry} onClick={() => { store.delegateAction(action.id, new Date(expiry).toISOString()); setExpiry(''); }}>委托分析员审批</Button></>}
+      </div>}
     </div>
   );
 }
@@ -54,7 +69,7 @@ export default function Page() {
     <section className="grid">
       <div className="stack">
         <Card><CardHeader><div><h2>事件摘要</h2><p className="muted">影响范围：{incident.affected.join(' · ')}</p></div><ShieldAlert color={incident.severity === 'critical' ? '#ef4444' : '#f59e0b'} /></CardHeader><CardContent><div className="incident-state"><span>处置阶段</span><strong>{incident.status}</strong></div><h3>子事件</h3>{incident.subIncidents.map((item) => <div className="sub-row" key={item.id}><div><strong>{item.title}</strong><div className="muted">{item.owner}</div></div><Badge>{item.status}</Badge></div>)}</CardContent></Card>
-        <Card><CardHeader><div><h2>{t('approval')}</h2><p className="muted">隔离动作需两名不同角色确认，敏感动作仅响应和法务角色可见。</p></div><Users size={20} /></CardHeader><CardContent><DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={dragEnd}><SortableContext items={incident.actions.map((item) => item.id)} strategy={verticalListSortingStrategy}><div>{incident.actions.map((action) => <SortableAction key={action.id} action={action} />)}</div></SortableContext></DndContext></CardContent></Card>
+        <Card><CardHeader><div><h2>{t('approval')}</h2><p className="muted">隔离动作需两名不同审批人；负责人可委托分析员代理单个动作，到期或撤销后审批即被拒绝。</p></div><Users size={20} /></CardHeader><CardContent><DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={dragEnd}><SortableContext items={incident.actions.map((item) => item.id)} strategy={verticalListSortingStrategy}><div>{incident.actions.map((action) => <SortableAction key={action.id} action={action} />)}</div></SortableContext></DndContext></CardContent></Card>
       </div>
       <div className="stack">
         <Card><CardHeader><h2>新增子事件</h2></CardHeader><CardContent><form onSubmit={form.handleSubmit((values) => { store.addSubIncident(values); form.reset(); })}><label>子事件名称<Input {...form.register('title')} placeholder="例如：凭据轮换" /></label><small className="error">{form.formState.errors.title?.message}</small><label>负责组<Input {...form.register('owner')} placeholder="例如：平台组" /></label><small className="error">{form.formState.errors.owner?.message}</small><Button type="submit" disabled={store.demoMode}><ShieldAlert size={16} />创建子事件</Button></form></CardContent></Card>
